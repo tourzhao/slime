@@ -20,6 +20,30 @@ from megatron.training.arguments import core_transformer_config_from_args
 from slime.utils.misc import load_function
 
 
+def _replace_core_attention_in_spec(spec, replacement_cls):
+    """Recursively replace core_attention in a layer/block spec."""
+    # Handle TransformerBlockSubmodules (returned by get_gpt_decoder_block_spec)
+    if hasattr(spec, "layer_specs") and not hasattr(spec, "submodules"):
+        for layer_spec in spec.layer_specs:
+            _replace_core_attention_in_spec(layer_spec, replacement_cls)
+        return
+    if hasattr(spec, "submodules"):
+        sub = spec.submodules
+        if hasattr(sub, "core_attention"):
+            sub.core_attention = replacement_cls
+        # Handle TransformerBlockSubmodules with layer_specs list
+        if hasattr(sub, "layer_specs"):
+            for layer_spec in sub.layer_specs:
+                _replace_core_attention_in_spec(layer_spec, replacement_cls)
+        # Recurse into nested specs
+        for attr in dir(sub):
+            if attr.startswith("_") or attr == "layer_specs":
+                continue
+            val = getattr(sub, attr)
+            if hasattr(val, "submodules"):
+                _replace_core_attention_in_spec(val, replacement_cls)
+
+
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
@@ -96,6 +120,26 @@ def get_model_provider_func(
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
         provider.finalize()
+
+        # Apply FlashDotProductAttention for learnable/off-by-one softmax (TE doesn't support these).
+        # The bridge stores transformer_layer_spec as a callable; wrap it to patch the spec on first call.
+        if getattr(provider, "softmax_type", "vanilla") != "vanilla":
+            from slime.backends.megatron_utils.kernels.flash_dot_product_attention import FlashDotProductAttention
+
+            _orig_spec_fn = provider.transformer_layer_spec
+
+            def _patched_spec_fn(*a, **kw):
+                spec = _orig_spec_fn(*a, **kw)
+                _replace_core_attention_in_spec(spec, FlashDotProductAttention)
+                return spec
+
+            provider.transformer_layer_spec = _patched_spec_fn
+
+            # Register FlashDotProductAttention with bridge so weight converter knows its parallelism type.
+            from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+            AutoMapping.register_module_type("FlashDotProductAttention", "column")
+
         return provider.provide
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
@@ -148,6 +192,13 @@ def get_model_provider_func(
                         multi_latent_attention=args.multi_latent_attention,
                         moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
                     )
+
+        # TE does not support learnable/off-by-one softmax with packed sequences (THD format).
+        # Replace core_attention with our flash-based implementation when needed.
+        if getattr(config, "softmax_type", "vanilla") != "vanilla":
+            from slime.backends.megatron_utils.kernels.flash_dot_product_attention import FlashDotProductAttention
+
+            _replace_core_attention_in_spec(transformer_layer_spec, FlashDotProductAttention)
 
         build_model_context = nullcontext
         build_model_context_args = {}
