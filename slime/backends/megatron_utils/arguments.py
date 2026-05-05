@@ -1,5 +1,4 @@
 import logging
-
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
@@ -12,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron validations."""
+
     _megatron_validate_args(args)
 
     # always use varlen
@@ -40,6 +40,15 @@ def _hf_validate_args(args, hf_config):
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
 
+    # Some models store rope_theta inside rope_parameters dict rather than
+    # as a top-level attribute.  Prefer the dict value when available so
+    # the validation doesn't compare against a stale class default.
+    rope_params = getattr(hf_config, "rope_parameters", None)
+    if isinstance(rope_params, dict) and "rope_theta" in rope_params:
+        _hf_rope_theta = rope_params["rope_theta"]
+    else:
+        _hf_rope_theta = getattr(hf_config, "rope_theta", None)
+
     for hf_config_name, megatron_config_name, compare_fn in [
         ("hidden_size", "hidden_size", equal),
         ("num_attention_heads", "num_attention_heads", equal),
@@ -47,14 +56,22 @@ def _hf_validate_args(args, hf_config):
         ("intermediate_size", "ffn_hidden_size", equal),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
         ("rms_norm_eps", "norm_epsilon", equal),
-        ("rope_theta", "rotary_base", equal),
+        ("rms_norm_eps", "layernorm_epsilon", equal),
     ]:
-        if hasattr(hf_config, hf_config_name):
+        if hasattr(hf_config, hf_config_name) and hasattr(args, megatron_config_name):
             if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
                 errors.append(
                     f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
                     f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
                 )
+
+    # Validate rope_theta separately using the resolved value
+    if _hf_rope_theta is not None:
+        if not equal(_hf_rope_theta, getattr(args, "rotary_base", None)):
+            errors.append(
+                f"rope_theta in hf config {_hf_rope_theta} is not equal to "
+                f"rotary_base {getattr(args, 'rotary_base', None)}, please check the config."
+            )
 
     if len(errors) > 0:
         raise AssertionError("hf_validate_args failed: " + "; ".join(errors))
@@ -101,9 +118,6 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
         _hf_validate_args(args, hf_config)
 
     args.rank = 0
-    if args.critic_train_only:
-        args.world_size = args.critic_num_nodes * args.critic_num_gpus_per_node
-    else:
-        args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+    args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
     args = _set_default_megatron_args(args)
     return args
